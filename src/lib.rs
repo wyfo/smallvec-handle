@@ -5,9 +5,11 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
-//! A [`Vec`]-like implementation backed by a local array. Contrary to other alternative
-//! `Vec` implementation, which use a tagged union to distinguish between local and heap storage,
-//! this one uses a single pointer for both local and heap slice.
+//! A [`Vec`]-like container that can store a small number of elements inline.
+//!
+//! Contrary to other alternative small vector implementation, which use a tagged union to
+//! distinguish between local and heap storage, this one uses a single pointer for both local and
+//! heap slice.
 //!
 //! Because the pointer may be invalidated when the vector is moved, it must be checked before each
 //! operation on the vector. To avoid needlessly repeating this check, it is done only once, while
@@ -15,7 +17,7 @@
 //! hence the crate name.
 //!
 //! When the whole data can fit in the local array, it allows saving an allocation, and may have
-//! better cache locality than a regular `Vec`. Also, it should be more performant than using a
+//! better cache locality than a regular `Vec`. Also, it can be more performant than using a
 //! tagged union implementation, because it avoids branching at each operation.
 //!
 //! # Examples
@@ -39,14 +41,15 @@ use core::{
     cmp::{max, Ordering},
     fmt,
     hash::{Hash, Hasher},
-    hint, mem,
+    hint,
+    iter::FusedIterator,
+    mem,
     mem::{ManuallyDrop, MaybeUninit},
     ops::{Bound, Deref, DerefMut, RangeBounds},
     ptr,
     ptr::NonNull,
     slice,
 };
-use std::iter::FusedIterator;
 
 /// A "handle" to mutate a [`SmallVec`] instance.
 ///
@@ -64,6 +67,7 @@ unsafe impl<T: Send, const N: usize> Send for SmallVecHandle<T, N> {}
 unsafe impl<T: Sync, const N: usize> Sync for SmallVecHandle<T, N> {}
 
 impl<T, const N: usize> SmallVecHandle<T, N> {
+    #[inline(always)]
     const fn is_local(&self) -> bool {
         self.cap == N
     }
@@ -84,7 +88,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
 
     /// # Safety
     ///
-    /// `PinnedVec` must have been allocated from a vector, see [`Self::grow`].
+    /// `SmallVec` must have been allocated from a vector, see [`Self::grow`].
     #[inline(always)]
     unsafe fn get_vec(&self) -> Vec<T> {
         unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.cap) }
@@ -278,10 +282,14 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         self.ptr.as_ptr()
     }
 
-    #[allow(clippy::missing_safety_doc)]
     /// Forces the length of the vector to `new_len`.
     ///
     /// See [Vec::set_len]
+    ///
+    /// # Safety
+    ///
+    /// - `new_len` must be less than or equal to [`capacity()`](Self::capacity).
+    /// - The elements at `old_len..new_len` must be initialized.
     #[inline]
     pub unsafe fn set_len(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.capacity());
@@ -1136,6 +1144,7 @@ impl<T, const N: usize> Drop for Drain<'_, T, N> {
 struct DeallocGuard<'a, T, const N: usize>(&'a mut SmallVec<T, N>);
 
 impl<T, const N: usize> Drop for DeallocGuard<'_, T, N> {
+    #[inline(always)]
     fn drop(&mut self) {
         let handle = &mut self.0 .0;
         if !handle.is_local() {
@@ -1158,7 +1167,7 @@ pub struct SmallVec<T, const N: usize>(SmallVecHandle<T, N>);
 
 impl<T, const N: usize> SmallVec<T, N> {
     const ASSERT: () = assert!(N > 0 && core::mem::size_of::<T>() > 0);
-    /// Construct a new, empty `UnpinnedVec<T, N>`.
+    /// Construct a new, empty `SmallVec<T, N>`.
     ///
     /// The vector is initialized with a capacity N.
     #[inline]
@@ -1273,8 +1282,6 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Converts the vector into [`Vec`].
-    ///
-    ///
     pub fn into_vec(self) -> Vec<T> {
         let this = ManuallyDrop::new(self);
         if this.0.is_local() {
@@ -1312,19 +1319,59 @@ impl<T, const N: usize> Default for SmallVec<T, N> {
 
 impl<T, const N: usize> FromIterator<T> for SmallVec<T, N> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        fn init_from_vec<T, const N: usize>(this: &mut SmallVec<T, N>, mut vec: Vec<T>) {
+            this.0.ptr = NonNull::new(vec.as_mut_ptr()).unwrap();
+            this.0.len = vec.len();
+            this.0.cap = vec.capacity();
+        }
+
         let mut this = Self::new();
-        let handle = this.handle();
-        let iter = iter.into_iter();
+        let mut iter = iter.into_iter();
         let (lower, _) = iter.size_hint();
         if lower > N {
-            let mut vec = Vec::from_iter(iter);
-            handle.ptr = NonNull::new(vec.as_mut_ptr()).unwrap();
-            handle.len = vec.len();
-            handle.cap = vec.capacity();
-        } else {
-            for item in iter {
-                handle.push(item);
+            #[cold]
+            fn from_iter_impl<T, const N: usize>(
+                this: &mut SmallVec<T, N>,
+                lower: usize,
+                iter: impl IntoIterator<Item = T>,
+            ) {
+                // Do not use `Vec::from_iter` to ensure the capacity is greater than N
+                // (handling the case where `lower` is wrong)
+                let mut vec = Vec::with_capacity(lower);
+                vec.extend(iter);
+                init_from_vec(this, vec);
             }
+            from_iter_impl(&mut this, lower, iter);
+            return this;
+        }
+        for i in 0..N {
+            match iter.next() {
+                Some(item) => this.0.local[i] = MaybeUninit::new(item),
+                None => return this,
+            }
+            this.0.len = i;
+        }
+        if let Some(item) = iter.next() {
+            #[cold]
+            fn from_iter_impl<T, const N: usize>(
+                this: &mut SmallVec<T, N>,
+                item: T,
+                iter: impl IntoIterator<Item = T>,
+            ) {
+                let mut vec = Vec::with_capacity(2 * N);
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        this.0.local.as_ptr().cast::<T>(),
+                        vec.as_mut_ptr(),
+                        N,
+                    );
+                    ptr::write(vec.as_mut_ptr().add(N + 1), item);
+                    vec.set_len(N + 1);
+                }
+                vec.extend(iter);
+                init_from_vec(this, vec);
+            }
+            from_iter_impl(&mut this, item, iter);
         }
         this
     }

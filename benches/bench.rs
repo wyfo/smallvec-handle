@@ -247,10 +247,12 @@ fn gen_push<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     b.iter(|| {
         let mut vec = V::new();
         let handle = V::handle(&mut vec);
-        for x in 0..n {
-            push_noinline(handle, x);
+        for x in 0..std::hint::black_box(n) {
+            //push_noinline(handle, x);
+            handle.push(std::hint::black_box(0));
+            // handle.push(x);
         }
-        vec
+        std::hint::black_box(&handle);
     });
 }
 
@@ -337,7 +339,8 @@ fn gen_extend_from_slice<V: Vector<u64>>(n: u64, b: &mut Bencher) {
         let mut vec = V::new();
         let handle = V::handle(&mut vec);
         handle.extend_from_slice(&v);
-        vec
+        std::hint::black_box(handle);
+        // vec
     });
 }
 
