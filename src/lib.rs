@@ -59,10 +59,11 @@ use core::{
 /// `SmallVec` doesn't derive `Deref`/`DerefMut` as the as
 /// [`as_slice`](SmallVec::as_slice)/[`as_mut_slice`](SmallVec::as_mut_slice) operations are not
 /// trivial.
+#[repr(C)] // Improves perf by a lot if the layout is the same as Vec, I don't know why
 pub struct SmallVec<T, const N: usize> {
+    cap: usize,
     ptr: NonNull<T>,
     len: usize,
-    cap: usize,
     local: [MaybeUninit<T>; N],
 }
 
@@ -85,9 +86,9 @@ impl<T, const N: usize> SmallVec<T, N> {
         // `[const { MaybeUninit::uninit() }; N]` syntax requires 1.79
         let local = unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
         Self {
+            cap: N,
             ptr: NonNull::dangling(),
             len: 0,
-            cap: N,
             local,
         }
     }
