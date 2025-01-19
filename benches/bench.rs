@@ -3,6 +3,8 @@
 
 extern crate test;
 
+use std::hint::black_box;
+
 use smallvec_handle::SmallVecHandle;
 use test::Bencher;
 
@@ -10,29 +12,39 @@ const VEC_SIZE: usize = 16;
 const SPILLED_SIZE: usize = 100;
 
 trait Vector<T> {
-    type Handle: VectorHandle<T>;
+    type Handle<'a>: VectorHandle<T>
+    where
+        Self: 'a;
     fn new() -> Self;
-    fn handle(&mut self) -> &mut Self::Handle;
+    fn handle(&mut self) -> Self::Handle<'_>;
     fn from_elem(val: T, n: usize) -> Self;
     fn from_elems(val: &[T]) -> Self;
 }
 
-trait VectorHandle<T>: Extend<T> {
+trait VectorHandle<T> {
+    type Reborrow<'b>: VectorHandle<T>
+    where
+        Self: 'b;
     fn push(&mut self, val: T);
     fn pop(&mut self) -> Option<T>;
     fn remove(&mut self, p: usize) -> T;
     fn insert(&mut self, n: usize, val: T);
     fn extend_from_slice(&mut self, other: &[T]);
+    fn extend(&mut self, iter: impl Iterator<Item = T>);
+    fn reborrow(&mut self) -> Self::Reborrow<'_>;
 }
 
 impl<T: Copy> Vector<T> for Vec<T> {
-    type Handle = Vec<T>;
+    type Handle<'a>
+        = &'a mut Vec<T>
+    where
+        T: 'a;
 
     fn new() -> Self {
         Self::with_capacity(VEC_SIZE)
     }
 
-    fn handle(&mut self) -> &mut Self::Handle {
+    fn handle(&mut self) -> Self::Handle<'_> {
         self
     }
 
@@ -45,36 +57,52 @@ impl<T: Copy> Vector<T> for Vec<T> {
     }
 }
 
-impl<T: Copy> VectorHandle<T> for Vec<T> {
+impl<'a, T: Copy> VectorHandle<T> for &'a mut Vec<T> {
+    type Reborrow<'b>
+        = &'b mut Vec<T>
+    where
+        'a: 'b,
+        T: 'b;
     fn push(&mut self, val: T) {
-        self.push(val)
+        (*self).push(val)
     }
 
     fn pop(&mut self) -> Option<T> {
-        self.pop()
+        (*self).pop()
     }
 
     fn remove(&mut self, p: usize) -> T {
-        self.remove(p)
+        (*self).remove(p)
     }
 
     fn insert(&mut self, n: usize, val: T) {
-        self.insert(n, val)
+        (*self).insert(n, val)
     }
 
     fn extend_from_slice(&mut self, other: &[T]) {
-        Vec::extend_from_slice(self, other)
+        Vec::extend_from_slice(*self, other)
+    }
+
+    fn extend(&mut self, iter: impl Iterator<Item = T>) {
+        (*self).extend(iter)
+    }
+
+    fn reborrow(&mut self) -> Self::Reborrow<'_> {
+        *self
     }
 }
 
 impl<T: Copy> Vector<T> for smallvec::SmallVec<T, VEC_SIZE> {
-    type Handle = smallvec::SmallVec<T, VEC_SIZE>;
+    type Handle<'a>
+        = &'a mut smallvec::SmallVec<T, VEC_SIZE>
+    where
+        T: 'a;
 
     fn new() -> Self {
         Self::new()
     }
 
-    fn handle(&mut self) -> &mut Self::Handle {
+    fn handle(&mut self) -> Self::Handle<'_> {
         self
     }
 
@@ -87,36 +115,53 @@ impl<T: Copy> Vector<T> for smallvec::SmallVec<T, VEC_SIZE> {
     }
 }
 
-impl<T: Copy> VectorHandle<T> for smallvec::SmallVec<T, VEC_SIZE> {
+impl<'a, T: Copy> VectorHandle<T> for &'a mut smallvec::SmallVec<T, VEC_SIZE> {
+    type Reborrow<'b>
+        = &'b mut smallvec::SmallVec<T, VEC_SIZE>
+    where
+        'a: 'b,
+        T: 'b;
+
     fn push(&mut self, val: T) {
-        self.push(val)
+        (*self).push(val)
     }
 
     fn pop(&mut self) -> Option<T> {
-        self.pop()
+        (*self).pop()
     }
 
     fn remove(&mut self, p: usize) -> T {
-        self.remove(p)
+        (*self).remove(p)
     }
 
     fn insert(&mut self, n: usize, val: T) {
-        self.insert(n, val)
+        (*self).insert(n, val)
     }
 
     fn extend_from_slice(&mut self, other: &[T]) {
-        self.extend_from_slice(other)
+        (*self).extend_from_slice(other)
+    }
+
+    fn extend(&mut self, iter: impl Iterator<Item = T>) {
+        (*self).extend(iter)
+    }
+
+    fn reborrow(&mut self) -> Self::Reborrow<'_> {
+        *self
     }
 }
 
 impl<T: Copy> Vector<T> for smallvec_handle::SmallVec<T, VEC_SIZE> {
-    type Handle = SmallVecHandle<T, VEC_SIZE>;
+    type Handle<'a>
+        = SmallVecHandle<'a, T, VEC_SIZE>
+    where
+        T: 'a;
 
     fn new() -> Self {
         Self::new()
     }
 
-    fn handle(&mut self) -> &mut Self::Handle {
+    fn handle(&mut self) -> Self::Handle<'_> {
         self.handle()
     }
 
@@ -133,7 +178,12 @@ impl<T: Copy> Vector<T> for smallvec_handle::SmallVec<T, VEC_SIZE> {
     }
 }
 
-impl<T: Copy> VectorHandle<T> for SmallVecHandle<T, VEC_SIZE> {
+impl<'a, T: Copy> VectorHandle<T> for SmallVecHandle<'a, T, VEC_SIZE> {
+    type Reborrow<'b>
+        = SmallVecHandle<'b, T, VEC_SIZE>
+    where
+        'a: 'b,
+        T: 'b;
     fn push(&mut self, val: T) {
         self.push(val)
     }
@@ -153,6 +203,14 @@ impl<T: Copy> VectorHandle<T> for SmallVecHandle<T, VEC_SIZE> {
     fn extend_from_slice(&mut self, other: &[T]) {
         self.extend_from_slice(other)
     }
+
+    fn extend(&mut self, iter: impl Iterator<Item = T>) {
+        Extend::extend(self, iter)
+    }
+
+    fn reborrow(&mut self) -> Self::Reborrow<'_> {
+        self.reborrow()
+    }
 }
 
 macro_rules! make_benches {
@@ -163,7 +221,7 @@ macro_rules! make_benches {
                 $g_name::<$typ>($($args,)* b)
             }
         )*
-    }
+    };
 }
 
 make_benches! {
@@ -240,88 +298,87 @@ make_benches! {
 
 fn gen_push<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     #[inline(never)]
-    fn push_noinline<H: VectorHandle<u64>>(handle: &mut H, x: u64) {
+    fn push_noinline<H: VectorHandle<u64>>(mut handle: H, x: u64) {
         handle.push(x);
     }
 
     b.iter(|| {
         let mut vec = V::new();
-        let handle = V::handle(&mut vec);
-        for x in 0..std::hint::black_box(n) {
-            //push_noinline(handle, x);
-            handle.push(std::hint::black_box(0));
-            // handle.push(x);
+        let mut handle = V::handle(&mut vec);
+        for x in 0..n {
+            push_noinline(handle.reborrow(), x);
         }
-        std::hint::black_box(&handle);
+        black_box(handle);
     });
 }
 
 fn gen_insert_push<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     #[inline(never)]
-    fn insert_push_noinline<H: VectorHandle<u64>>(handle: &mut H, x: u64) {
+    fn insert_push_noinline<H: VectorHandle<u64>>(mut handle: H, x: u64) {
         handle.insert(x as usize, x);
     }
 
     b.iter(|| {
         let mut vec = V::new();
-        let handle = V::handle(&mut vec);
+        let mut handle = V::handle(&mut vec);
         for x in 0..n {
-            insert_push_noinline(handle, x);
+            insert_push_noinline(handle.reborrow(), x);
         }
-        vec
+        black_box(handle);
     });
 }
 
 fn gen_insert<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     #[inline(never)]
-    fn insert_noinline<H: VectorHandle<u64>>(handle: &mut H, p: usize, x: u64) {
+    fn insert_noinline<H: VectorHandle<u64>>(mut handle: H, p: usize, x: u64) {
         handle.insert(p, x)
     }
 
     b.iter(|| {
         let mut vec = V::new();
-        let handle = V::handle(&mut vec);
+        let mut handle = V::handle(&mut vec);
         // Always insert at position 0 so that we are subject to shifts of
         // many different lengths.
         handle.push(0);
         for x in 0..n {
-            insert_noinline(handle, 0, x);
+            insert_noinline(handle.reborrow(), 0, x);
         }
-        vec
+        black_box(handle);
     });
 }
 
 fn gen_remove<V: Vector<u64>>(n: usize, b: &mut Bencher) {
     #[inline(never)]
-    fn remove_noinline<H: VectorHandle<u64>>(handle: &mut H, p: usize) -> u64 {
+    fn remove_noinline<H: VectorHandle<u64>>(mut handle: H, p: usize) -> u64 {
         handle.remove(p)
     }
 
     b.iter(|| {
         let mut vec = V::from_elem(0, n as _);
-        let handle = V::handle(&mut vec);
+        let mut handle = V::handle(&mut vec);
 
         for _ in 0..n {
-            remove_noinline(handle, 0);
+            remove_noinline(handle.reborrow(), 0);
         }
+        black_box(handle);
     });
 }
 
 fn gen_extend<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     b.iter(|| {
         let mut vec = V::new();
-        let handle = V::handle(&mut vec);
+        let mut handle = V::handle(&mut vec);
         handle.extend(0..n);
-        vec
+        black_box(handle);
     });
 }
 
 fn gen_extend_filtered<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     b.iter(|| {
         let mut vec = V::new();
-        let handle = V::handle(&mut vec);
+        let mut handle = V::handle(&mut vec);
         handle.extend((0..n).filter(|i| i % 2 == 0));
-        vec
+        black_box(handle);
     });
 }
 
@@ -329,7 +386,7 @@ fn gen_from_slice<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     let v: Vec<u64> = (0..n).collect();
     b.iter(|| {
         let vec = V::from_elems(&v);
-        vec
+        black_box(vec);
     });
 }
 
@@ -337,33 +394,32 @@ fn gen_extend_from_slice<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     let v: Vec<u64> = (0..n).collect();
     b.iter(|| {
         let mut vec = V::new();
-        let handle = V::handle(&mut vec);
+        let mut handle = V::handle(&mut vec);
         handle.extend_from_slice(&v);
-        std::hint::black_box(handle);
-        // vec
+        black_box(handle);
     });
 }
 
 fn gen_pushpop<V: Vector<u64>>(b: &mut Bencher) {
     #[inline(never)]
-    fn pushpop_noinline<H: VectorHandle<u64>>(handle: &mut H, x: u64) -> Option<u64> {
+    fn pushpop_noinline<H: VectorHandle<u64>>(mut handle: H, x: u64) -> Option<u64> {
         handle.push(x);
         handle.pop()
     }
 
     b.iter(|| {
         let mut vec = V::new();
-        let handle = V::handle(&mut vec);
+        let mut handle = V::handle(&mut vec);
         for x in 0..SPILLED_SIZE as _ {
-            pushpop_noinline(handle, x);
+            pushpop_noinline(handle.reborrow(), x);
         }
-        vec
+        black_box(handle);
     });
 }
 
 fn gen_from_elem<V: Vector<u64>>(n: usize, b: &mut Bencher) {
     b.iter(|| {
         let vec = V::from_elem(42, n);
-        vec
+        black_box(vec);
     });
 }

@@ -25,10 +25,10 @@
 //! ```
 //! # use smallvec_handle::SmallVec;
 //! let mut vec = SmallVec::<usize, 16>::new();
-//! let vec_handle = vec.handle();
+//! let mut vec_handle = vec.handle();
 //! vec_handle.push(0);
 //! vec_handle.push(1);
-//! assert_eq!(vec_handle.as_slice(), [0, 1]);
+//! assert_eq!(vec_handle, [0, 1]);
 //! assert_eq!(vec.as_slice(), [0, 1]);
 //! ```
 
@@ -51,10 +51,15 @@ use core::{
     slice,
 };
 
-/// A "handle" to mutate a [`SmallVec`] instance.
+/// A [`Vec`]-like container with a local storage.
 ///
-/// It provides a similar API to `Vec`.
-pub struct SmallVecHandle<T, const N: usize> {
+/// It is mutated through a [`SmallVecHandle`] returned by [`handle`](SmallVec::handle) method.
+/// See [crate documentation](crate).
+///
+/// `SmallVec` doesn't derive `Deref`/`DerefMut` as the as
+/// [`as_slice`](SmallVec::as_slice)/[`as_mut_slice`](SmallVec::as_mut_slice) operations are not
+/// trivial.
+pub struct SmallVec<T, const N: usize> {
     ptr: NonNull<T>,
     len: usize,
     cap: usize,
@@ -62,14 +67,51 @@ pub struct SmallVecHandle<T, const N: usize> {
 }
 
 // SAFETY: the data referenced by the inner pointer is unaliased
-unsafe impl<T: Send, const N: usize> Send for SmallVecHandle<T, N> {}
+unsafe impl<T: Send, const N: usize> Send for SmallVec<T, N> {}
 // SAFETY: the data referenced by the inner pointer is unaliased
-unsafe impl<T: Sync, const N: usize> Sync for SmallVecHandle<T, N> {}
+unsafe impl<T: Sync, const N: usize> Sync for SmallVec<T, N> {}
 
-impl<T, const N: usize> SmallVecHandle<T, N> {
+impl<T, const N: usize> SmallVec<T, N> {
+    const ASSERT: () = assert!(N > 0 && core::mem::size_of::<T>() > 0);
+    /// Construct a new, empty `SmallVec<T, N>`.
+    ///
+    /// The vector is initialized with a capacity N.
+    #[inline]
+    pub const fn new() -> Self {
+        #[allow(path_statements)]
+        Self::ASSERT;
+        // SAFETY: An uninitialized `[MaybeUninit<_>; N]` is valid (previous implementation of
+        // `MaybeUninit::uninit_array`)
+        // `[const { MaybeUninit::uninit() }; N]` syntax requires 1.79
+        let local = unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
+        Self {
+            ptr: NonNull::dangling(),
+            len: 0,
+            cap: N,
+            local,
+        }
+    }
+
     #[inline(always)]
     const fn is_local(&self) -> bool {
         self.cap == N
+    }
+
+    /// # Safety
+    ///
+    /// `SmallVec` must have been allocated from a vector, see [`Self::grow`].
+    #[inline(always)]
+    unsafe fn get_vec(&self) -> Vec<T> {
+        unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.cap) }
+    }
+
+    /// Returns a [`SmallVecHandle`] reference.
+    #[inline]
+    pub fn handle(&mut self) -> SmallVecHandle<T, N> {
+        if self.is_local() {
+            self.ptr = NonNull::new(self.local.as_mut_ptr().cast()).unwrap();
+        }
+        SmallVecHandle(self)
     }
 
     /// Returns the total number of elements the vector can hold without
@@ -81,17 +123,293 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         self.cap
     }
 
-    #[inline(always)]
-    fn need_grow(&self, additional: usize) -> bool {
-        self.len + additional > self.cap
+    /// Returns the number of elements in the vector, also referred to
+    /// as its 'length'.
+    ///
+    /// See [Vec::len]
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
     }
 
+    /// Returns `true` if the vector contains no elements.
+    ///
+    /// See [Vec::is_empty]
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns a raw pointer to the vector's buffer, or a dangling raw pointer
+    /// valid for zero sized reads if the vector didn't allocate.
+    ///
+    /// See [Vec::as_ptr]
+    #[inline]
+    pub const fn as_ptr(&self) -> *const T {
+        if self.is_local() {
+            self.local.as_ptr().cast()
+        } else {
+            self.ptr.as_ptr()
+        }
+    }
+
+    /// Returns a raw mutable pointer to the vector's buffer, or a dangling
+    /// raw pointer valid for zero sized reads if the vector didn't allocate.
+    ///
+    /// See [Vec::as_mut_ptr]
+    #[inline]
+    pub const fn as_mut_ptr(&mut self) -> *mut T {
+        if self.is_local() {
+            self.local.as_mut_ptr().cast()
+        } else {
+            self.ptr.as_ptr()
+        }
+    }
+
+    /// Forces the length of the vector to `new_len`.
+    ///
+    /// See [Vec::set_len]
+    ///
     /// # Safety
     ///
-    /// `SmallVec` must have been allocated from a vector, see [`Self::grow`].
+    /// - `new_len` must be less than or equal to [`capacity()`](Self::capacity).
+    /// - The elements at `old_len..new_len` must be initialized.
+    #[inline]
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.capacity());
+        self.len = new_len;
+    }
+
+    /// Extracts a slice containing the entire vector.
+    ///
+    /// See [Vec::as_slice]
+    pub const fn as_slice(&self) -> &[T] {
+        unsafe { slice::from_raw_parts(self.as_ptr(), self.len) }
+    }
+
+    /// Extracts a mutable slice of the entire vector.
+    ///
+    /// See [Vec::as_mut_slice]
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
+    }
+
+    /// Returns the remaining spare capacity of the vector as a slice of
+    /// `MaybeUninit<T>`.
+    ///
+    /// See [Vec::spare_capacity_mut]
+    #[inline]
+    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+        // SAFETY: copied from stdlib
+        unsafe {
+            slice::from_raw_parts_mut(
+                self.as_mut_ptr().add(self.len) as *mut MaybeUninit<T>,
+                self.cap - self.len,
+            )
+        }
+    }
+
+    /// Converts the vector into [`Box<[T]>`](Box).
+    ///
+    /// See [Vec::into_boxed_slice]
+    pub fn into_boxed_slice(self) -> Box<[T]> {
+        if self.is_local() {
+            let this = ManuallyDrop::new(self);
+            let mut vec = Vec::with_capacity(this.len);
+            unsafe {
+                ptr::copy_nonoverlapping(this.local.as_ptr().cast(), vec.as_mut_ptr(), this.len);
+            }
+            vec.into_boxed_slice()
+        } else {
+            self.into_vec().into()
+        }
+    }
+
+    /// Converts the vector into [`Vec`].
+    pub fn into_vec(self) -> Vec<T> {
+        let this = ManuallyDrop::new(self);
+        if this.is_local() {
+            let mut vec = Vec::with_capacity(N);
+            let local_ptr = this.local.as_ptr().cast();
+            unsafe {
+                ptr::copy_nonoverlapping(local_ptr, vec.as_mut_ptr(), this.len);
+            }
+            vec
+        } else {
+            unsafe { this.get_vec() }
+        }
+    }
+}
+
+impl<T, const N: usize> Drop for SmallVec<T, N> {
+    fn drop(&mut self) {
+        let guard = DeallocGuard(self);
+        let slice = ptr::slice_from_raw_parts_mut(guard.0.as_mut_ptr(), guard.0.len());
+        unsafe { ptr::drop_in_place(slice) };
+    }
+}
+
+impl<T: fmt::Debug, const N: usize> fmt::Debug for SmallVec<T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
+impl<T, const N: usize> Default for SmallVec<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, const N: usize> FromIterator<T> for SmallVec<T, N> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        fn init_from_vec<T, const N: usize>(this: &mut SmallVec<T, N>, mut vec: Vec<T>) {
+            this.ptr = NonNull::new(vec.as_mut_ptr()).unwrap();
+            this.len = vec.len();
+            this.cap = vec.capacity();
+        }
+
+        let mut this = Self::new();
+        let mut iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        if lower > N {
+            #[cold]
+            fn from_iter_impl<T, const N: usize>(
+                this: &mut SmallVec<T, N>,
+                lower: usize,
+                iter: impl IntoIterator<Item = T>,
+            ) {
+                // Do not use `Vec::from_iter` to ensure the capacity is greater than N
+                // (handling the case where `lower` is wrong)
+                let mut vec = Vec::with_capacity(lower);
+                vec.extend(iter);
+                init_from_vec(this, vec);
+            }
+            from_iter_impl(&mut this, lower, iter);
+            return this;
+        }
+        for i in 0..N {
+            match iter.next() {
+                Some(item) => this.local[i] = MaybeUninit::new(item),
+                None => return this,
+            }
+            this.len = i;
+        }
+        if let Some(item) = iter.next() {
+            #[cold]
+            fn from_iter_impl<T, const N: usize>(
+                this: &mut SmallVec<T, N>,
+                item: T,
+                iter: impl IntoIterator<Item = T>,
+            ) {
+                let mut vec = Vec::<T>::with_capacity(2 * N);
+                unsafe {
+                    ptr::copy_nonoverlapping(this.local.as_ptr().cast(), vec.as_mut_ptr(), N);
+                    ptr::write(vec.as_mut_ptr().add(N + 1), item);
+                    vec.set_len(N + 1);
+                }
+                vec.extend(iter);
+                init_from_vec(this, vec);
+            }
+            from_iter_impl(&mut this, item, iter);
+        }
+        this
+    }
+}
+
+impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
+    type Item = T;
+    type IntoIter = IntoIter<T, N>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter {
+            vec: ManuallyDrop::new(self),
+            cur: 0,
+        }
+    }
+}
+
+/// An iterator that moves out of a vector.
+///
+/// See [`alloc::vec::IntoIter`]
+pub struct IntoIter<T, const N: usize> {
+    vec: ManuallyDrop<SmallVec<T, N>>,
+    cur: usize,
+}
+
+impl<T, const N: usize> Iterator for IntoIter<T, N> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cur == self.vec.len() {
+            return None;
+        }
+        let item = unsafe { self.vec.as_ptr().add(self.cur).read() };
+        self.cur += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let size = self.vec.len() - self.cur;
+        (size, Some(size))
+    }
+}
+
+impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.cur == self.vec.len() {
+            return None;
+        }
+        self.vec.len -= 1;
+        let item = unsafe { self.vec.as_ptr().add(self.vec.len()).read() };
+        Some(item)
+    }
+}
+
+impl<T, const N: usize> ExactSizeIterator for IntoIter<T, N> {}
+
+impl<T, const N: usize> FusedIterator for IntoIter<T, N> {}
+
+impl<T, const N: usize> Drop for IntoIter<T, N> {
+    fn drop(&mut self) {
+        let guard = DeallocGuard(&mut self.vec);
+        let ptr = unsafe { guard.0.as_mut_ptr().add(self.cur) };
+        let slice = ptr::slice_from_raw_parts_mut(ptr, guard.0.len() - self.cur);
+        unsafe { ptr::drop_in_place(slice) };
+    }
+}
+
+struct DeallocGuard<'a, T, const N: usize>(&'a mut SmallVec<T, N>);
+
+impl<T, const N: usize> Drop for DeallocGuard<'_, T, N> {
     #[inline(always)]
-    unsafe fn get_vec(&self) -> Vec<T> {
-        unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.cap) }
+    fn drop(&mut self) {
+        let handle = &mut self.0;
+        if !handle.is_local() {
+            let ptr = handle.ptr.as_ptr().cast::<MaybeUninit<T>>();
+            drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, handle.cap)) });
+        }
+    }
+}
+
+/// A "handle" to mutate a [`SmallVec`] instance.
+///
+/// It provides a similar API to `Vec`.
+pub struct SmallVecHandle<'a, T, const N: usize>(&'a mut SmallVec<T, N>);
+
+impl<T, const N: usize> SmallVecHandle<'_, T, N> {
+    /// Returns the total number of elements the vector can hold without
+    /// reallocating.
+    ///
+    /// See [Vec::capacity]
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        self.0.cap
+    }
+
+    #[inline(always)]
+    fn need_grow(&self, additional: usize) -> bool {
+        self.0.len + additional > self.0.cap
     }
 
     /// # Safety
@@ -103,20 +421,21 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         try_: bool,
         exact: bool,
     ) -> Result<(), TryReserveError> {
-        let mut vec = ManuallyDrop::new(if self.is_local() {
+        let this = &mut *self.0;
+        let mut vec = ManuallyDrop::new(if this.is_local() {
             if exact {
-                additional += self.len;
+                additional += this.len;
             } else {
-                additional = max(self.len + additional, 2 * N);
+                additional = max(this.len + additional, 2 * N);
             }
             Vec::<T>::new()
         } else {
             if !exact {
-                additional = max(additional, 2 * self.cap - self.len);
+                additional = max(additional, 2 * this.cap - this.len);
             }
             // SAFETY: cap != N means the vector has been recreated from a vec
             // (see branch above)
-            unsafe { self.get_vec() }
+            unsafe { this.get_vec() }
         });
         if additional <= vec.capacity() - vec.len() {
             // SAFETY: `need_grow` has returned `true`
@@ -127,12 +446,12 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         } else {
             vec.reserve_exact(additional);
         }
-        if self.cap == N {
+        if this.cap == N {
             // SAFETY: src and dst are valid and non-overlapping
-            unsafe { ptr::copy_nonoverlapping(self.as_ptr(), vec.as_mut_ptr(), self.len) };
+            unsafe { ptr::copy_nonoverlapping(this.as_ptr(), vec.as_mut_ptr(), this.len) };
         }
-        self.ptr = NonNull::new(vec.as_mut_ptr()).unwrap();
-        self.cap = vec.capacity();
+        this.ptr = NonNull::new(vec.as_mut_ptr()).unwrap();
+        this.cap = vec.capacity();
         Ok(())
     }
 
@@ -200,6 +519,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
     /// See [Vec::truncate]
     #[inline]
     pub fn truncate(&mut self, len: usize) {
+        let this = &mut *self.0;
         // SAFETY: copied from stdlib
         // This is safe because:
         //
@@ -212,12 +532,12 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
             // Note: It's intentional that this is `>` and not `>=`.
             //       Changing it to `>=` has negative performance
             //       implications in some cases. See #78884 for more.
-            if len > self.len {
+            if len > this.len {
                 return;
             }
-            let remaining_len = self.len - len;
-            let s = ptr::slice_from_raw_parts_mut(self.as_mut_ptr().add(len), remaining_len);
-            self.len = len;
+            let remaining_len = this.len - len;
+            let s = ptr::slice_from_raw_parts_mut(this.as_mut_ptr().add(len), remaining_len);
+            this.len = len;
             ptr::drop_in_place(s);
         }
     }
@@ -240,7 +560,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         // * We only construct `&mut` references to `self.buf` through `&mut self` methods; borrow-
         //   check ensures that it is not possible to mutably alias `self.buf` within the
         //   returned lifetime.
-        unsafe { slice::from_raw_parts(self.as_ptr(), self.len) }
+        unsafe { slice::from_raw_parts(self.as_ptr(), self.0.len) }
     }
 
     /// Extracts a mutable slice of the entire vector.
@@ -261,7 +581,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         // * We only construct references to `self.buf` through `&self` and `&mut self` methods;
         //   borrow-check ensures that it is not possible to construct a reference to `self.buf`
         //   within the returned lifetime.
-        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.0.len) }
     }
 
     /// Returns a raw pointer to the vector's buffer, or a dangling raw pointer
@@ -270,7 +590,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
     /// See [Vec::as_ptr]
     #[inline]
     pub const fn as_ptr(&self) -> *const T {
-        self.ptr.as_ptr().cast_const()
+        self.0.ptr.as_ptr().cast_const()
     }
 
     /// Returns a raw mutable pointer to the vector's buffer, or a dangling
@@ -279,7 +599,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
     /// See [Vec::as_mut_ptr]
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.ptr.as_ptr()
+        self.0.ptr.as_ptr()
     }
 
     /// Forces the length of the vector to `new_len`.
@@ -292,8 +612,8 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
     /// - The elements at `old_len..new_len` must be initialized.
     #[inline]
     pub unsafe fn set_len(&mut self, new_len: usize) {
-        debug_assert!(new_len <= self.capacity());
-        self.len = new_len;
+        // SAFETY: same function contract
+        unsafe { self.0.set_len(new_len) }
     }
 
     /// Removes an element from the vector and returns it.
@@ -439,7 +759,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         // It shifts unchecked elements to cover holes and `set_len` to the correct length.
         // In cases when predicate and `drop` never panick, it will be optimized out.
         struct BackshiftOnDrop<'a, T, const N: usize> {
-            v: &'a mut SmallVecHandle<T, N>,
+            v: &'a mut SmallVec<T, N>,
             processed_len: usize,
             deleted_cnt: usize,
             original_len: usize,
@@ -467,7 +787,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         }
 
         let mut g = BackshiftOnDrop {
-            v: self,
+            v: &mut *self.0,
             processed_len: 0,
             deleted_cnt: 0,
             original_len,
@@ -580,7 +900,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
             write: usize,
 
             /* The Vec that would need correction if `same_bucket` panicked */
-            vec: &'a mut SmallVecHandle<T, N>,
+            vec: &'a mut SmallVec<T, N>,
         }
 
         impl<T, const N: usize> Drop for FillGapOnDrop<'_, T, N> {
@@ -623,7 +943,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         let mut gap = FillGapOnDrop {
             read: first_duplicate_idx + 1,
             write: first_duplicate_idx,
-            vec: self,
+            vec: &mut *self.0,
         };
         // SAFETY: copied from stdlib
         unsafe {
@@ -674,7 +994,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
     #[inline]
     pub fn push(&mut self, value: T) {
         // Inform codegen that the length does not change across grow_one().
-        let len = self.len;
+        let len = self.0.len;
         // This will panic or abort if we would allocate > isize::MAX bytes
         // or if the length increment would overflow for zero-sized types.
         if self.need_grow(1) {
@@ -685,7 +1005,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         unsafe {
             let end = self.as_mut_ptr().add(len);
             ptr::write(end, value);
-            self.len = len + 1;
+            self.0.len = len + 1;
         }
     }
 
@@ -695,13 +1015,13 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
     /// See [Vec::pop]
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
-        if self.len == 0 {
+        if self.0.len == 0 {
             None
         } else {
             // SAFETY: copied from stdlib
             unsafe {
-                self.len -= 1;
-                if self.len >= self.capacity() {
+                self.0.len -= 1;
+                if self.0.len >= self.capacity() {
                     hint::unreachable_unchecked();
                 }
                 Some(ptr::read(self.as_ptr().add(self.len())))
@@ -761,7 +1081,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
                 tail_start: end,
                 tail_len: len - end,
                 iter: range_slice.iter(),
-                vec: NonNull::from(self),
+                vec: NonNull::from(&mut *self.0),
             }
         }
     }
@@ -780,7 +1100,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         //   do nothing (leaking the rest of the elements) instead of dropping
         //   some twice.
         unsafe {
-            self.len = 0;
+            self.0.len = 0;
             ptr::drop_in_place(elems);
         }
     }
@@ -791,7 +1111,7 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
     /// See [Vec::len]
     #[inline]
     pub const fn len(&self) -> usize {
-        self.len
+        self.0.len
     }
 
     /// Returns `true` if the vector contains no elements.
@@ -836,14 +1156,20 @@ impl<T, const N: usize> SmallVecHandle<T, N> {
         // SAFETY: copied from stdlib
         unsafe {
             slice::from_raw_parts_mut(
-                self.as_mut_ptr().add(self.len) as *mut MaybeUninit<T>,
-                self.cap - self.len,
+                self.as_mut_ptr().add(self.0.len) as *mut MaybeUninit<T>,
+                self.0.cap - self.0.len,
             )
         }
     }
+
+    /// Reborrows a handle
+    #[inline]
+    pub fn reborrow(&mut self) -> SmallVecHandle<'_, T, N> {
+        SmallVecHandle(&mut *self.0)
+    }
 }
 
-impl<T: Clone, const N: usize> SmallVecHandle<T, N> {
+impl<T: Clone, const N: usize> SmallVecHandle<'_, T, N> {
     /// Resizes the vector in-place so that `len` is equal to `new_len`.
     ///
     /// See [Vec::resize]
@@ -875,11 +1201,11 @@ impl<T: Clone, const N: usize> SmallVecHandle<T, N> {
         let len = self.len();
         // SAFETY: copied from stdlib
         unsafe { ptr::copy_nonoverlapping(other.as_ptr(), self.as_mut_ptr().add(len), count) };
-        self.len += count;
+        self.0.len += count;
     }
 }
 
-impl<T: PartialEq, const N: usize> SmallVecHandle<T, N> {
+impl<T: PartialEq, const N: usize> SmallVecHandle<'_, T, N> {
     /// Removes consecutive repeated elements in the vector according to the
     /// [`PartialEq`] trait implementation.
     ///
@@ -890,7 +1216,7 @@ impl<T: PartialEq, const N: usize> SmallVecHandle<T, N> {
     }
 }
 
-impl<T, const N: usize> Deref for SmallVecHandle<T, N> {
+impl<T, const N: usize> Deref for SmallVecHandle<'_, T, N> {
     type Target = [T];
 
     #[inline]
@@ -899,21 +1225,21 @@ impl<T, const N: usize> Deref for SmallVecHandle<T, N> {
     }
 }
 
-impl<T, const N: usize> DerefMut for SmallVecHandle<T, N> {
+impl<T, const N: usize> DerefMut for SmallVecHandle<'_, T, N> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<T: Hash, const N: usize> Hash for SmallVecHandle<T, N> {
+impl<T: Hash, const N: usize> Hash for SmallVecHandle<'_, T, N> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         Hash::hash(&**self, state);
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a SmallVecHandle<T, N> {
+impl<'a, T, const N: usize> IntoIterator for &'a SmallVecHandle<'_, T, N> {
     type Item = &'a T;
     type IntoIter = slice::Iter<'a, T>;
 
@@ -922,7 +1248,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a SmallVecHandle<T, N> {
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a mut SmallVecHandle<T, N> {
+impl<'a, T, const N: usize> IntoIterator for &'a mut SmallVecHandle<'_, T, N> {
     type Item = &'a mut T;
     type IntoIter = slice::IterMut<'a, T>;
 
@@ -931,7 +1257,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a mut SmallVecHandle<T, N> {
     }
 }
 
-impl<T, const N: usize> Extend<T> for SmallVecHandle<T, N> {
+impl<T, const N: usize> Extend<T> for SmallVecHandle<'_, T, N> {
     #[inline]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         let iter = iter.into_iter();
@@ -942,7 +1268,7 @@ impl<T, const N: usize> Extend<T> for SmallVecHandle<T, N> {
     }
 }
 
-impl<'a, T: Copy + 'a, const N: usize> Extend<&'a T> for SmallVecHandle<T, N> {
+impl<'a, T: Copy + 'a, const N: usize> Extend<&'a T> for SmallVecHandle<'_, T, N> {
     #[inline]
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         let iter = iter.into_iter();
@@ -953,8 +1279,8 @@ impl<'a, T: Copy + 'a, const N: usize> Extend<&'a T> for SmallVecHandle<T, N> {
     }
 }
 
-impl<T, U, const N1: usize, const N2: usize> PartialEq<SmallVecHandle<U, N2>>
-    for SmallVecHandle<T, N1>
+impl<T, U, const N1: usize, const N2: usize> PartialEq<SmallVecHandle<'_, U, N2>>
+    for SmallVecHandle<'_, T, N1>
 where
     T: PartialEq<U>,
 {
@@ -964,7 +1290,7 @@ where
     }
 }
 
-impl<T, U, const N: usize> PartialEq<[U]> for SmallVecHandle<T, N>
+impl<T, U, const N: usize> PartialEq<[U]> for SmallVecHandle<'_, T, N>
 where
     T: PartialEq<U>,
 {
@@ -974,51 +1300,80 @@ where
     }
 }
 
-impl<T, const N1: usize, const N2: usize> PartialOrd<SmallVecHandle<T, N2>>
-    for SmallVecHandle<T, N1>
+impl<T, U, const N: usize> PartialEq<&[U]> for SmallVecHandle<'_, T, N>
+where
+    T: PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &&[U]) -> bool {
+        self[..] == other[..]
+    }
+}
+
+impl<T, U, const N: usize, const M: usize> PartialEq<[U; M]> for SmallVecHandle<'_, T, N>
+where
+    T: PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &[U; M]) -> bool {
+        self[..] == other[..]
+    }
+}
+
+impl<T, U, const N: usize, const M: usize> PartialEq<&[U; M]> for SmallVecHandle<'_, T, N>
+where
+    T: PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &&[U; M]) -> bool {
+        self[..] == other[..]
+    }
+}
+
+impl<T, const N: usize> PartialOrd for SmallVecHandle<'_, T, N>
 where
     T: PartialOrd,
 {
     #[inline]
-    fn partial_cmp(&self, other: &SmallVecHandle<T, N2>) -> Option<Ordering> {
-        PartialOrd::partial_cmp(&**self, &**other)
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.as_slice().partial_cmp(other.as_slice())
     }
 }
 
-impl<T: Eq, const N: usize> Eq for SmallVecHandle<T, N> {}
+impl<T: Eq, const N: usize> Eq for SmallVecHandle<'_, T, N> {}
 
-impl<T: Ord, const N: usize> Ord for SmallVecHandle<T, N> {
+impl<T: Ord, const N: usize> Ord for SmallVecHandle<'_, T, N> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        Ord::cmp(&**self, &**other)
+        self.as_slice().cmp(other.as_slice())
     }
 }
 
-impl<T: fmt::Debug, const N: usize> fmt::Debug for SmallVecHandle<T, N> {
+impl<T: fmt::Debug, const N: usize> fmt::Debug for SmallVecHandle<'_, T, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T, const N: usize> AsRef<[T]> for SmallVecHandle<T, N> {
+impl<T, const N: usize> AsRef<[T]> for SmallVecHandle<'_, T, N> {
     fn as_ref(&self) -> &[T] {
         self
     }
 }
 
-impl<T, const N: usize> AsMut<[T]> for SmallVecHandle<T, N> {
+impl<T, const N: usize> AsMut<[T]> for SmallVecHandle<'_, T, N> {
     fn as_mut(&mut self) -> &mut [T] {
         self
     }
 }
 
-impl<T, const N: usize> Borrow<[T]> for SmallVecHandle<T, N> {
+impl<T, const N: usize> Borrow<[T]> for SmallVecHandle<'_, T, N> {
     fn borrow(&self) -> &[T] {
         &self[..]
     }
 }
 
-impl<T, const N: usize> BorrowMut<[T]> for SmallVecHandle<T, N> {
+impl<T, const N: usize> BorrowMut<[T]> for SmallVecHandle<'_, T, N> {
     fn borrow_mut(&mut self) -> &mut [T] {
         &mut self[..]
     }
@@ -1031,7 +1386,7 @@ pub struct Drain<'a, T, const N: usize> {
     tail_start: usize,
     tail_len: usize,
     iter: slice::Iter<'a, T>,
-    vec: NonNull<SmallVecHandle<T, N>>,
+    vec: NonNull<SmallVec<T, N>>,
 }
 
 impl<T, const N: usize> Drain<'_, T, N> {
@@ -1138,303 +1493,5 @@ impl<T, const N: usize> Drop for Drain<'_, T, N> {
             let to_drop = ptr::slice_from_raw_parts_mut(vec_ptr.add(drop_offset), drop_len);
             ptr::drop_in_place(to_drop);
         }
-    }
-}
-
-struct DeallocGuard<'a, T, const N: usize>(&'a mut SmallVec<T, N>);
-
-impl<T, const N: usize> Drop for DeallocGuard<'_, T, N> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        let handle = &mut self.0 .0;
-        if !handle.is_local() {
-            let ptr = handle.ptr.as_ptr().cast::<MaybeUninit<T>>();
-            drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, handle.cap)) });
-        }
-    }
-}
-
-/// A [`Vec`]-like collection with a local storage.
-///
-/// It is mutated through a [`SmallVecHandle`] returned by [`handle`](SmallVec::handle) method.
-/// See [crate documentation](crate).
-///
-/// `SmallVec` doesn't derive `Deref`/`DerefMut` as the as
-/// [`as_slice`](SmallVec::as_slice)/[`as_mut_slice`](SmallVec::as_mut_slice) operations are not
-/// trivial.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SmallVec<T, const N: usize>(SmallVecHandle<T, N>);
-
-impl<T, const N: usize> SmallVec<T, N> {
-    const ASSERT: () = assert!(N > 0 && core::mem::size_of::<T>() > 0);
-    /// Construct a new, empty `SmallVec<T, N>`.
-    ///
-    /// The vector is initialized with a capacity N.
-    #[inline]
-    pub const fn new() -> Self {
-        #[allow(path_statements)]
-        Self::ASSERT;
-        // SAFETY: An uninitialized `[MaybeUninit<_>; N]` is valid (previous implementation of
-        // `MaybeUninit::uninit_array`)
-        // `[const { MaybeUninit::uninit() }; N]` syntax requires 1.79
-        let local = unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
-        Self(SmallVecHandle {
-            ptr: NonNull::dangling(),
-            len: 0,
-            cap: N,
-            local,
-        })
-    }
-
-    /// Returns a [`SmallVecHandle`] reference.
-    #[inline]
-    pub fn handle(&mut self) -> &mut SmallVecHandle<T, N> {
-        if self.0.is_local() {
-            self.0.ptr = NonNull::new(self.0.local.as_mut_ptr().cast()).unwrap();
-        }
-        &mut self.0
-    }
-
-    /// Returns the total number of elements the vector can hold without
-    /// reallocating.
-    ///
-    /// See [Vec::capacity]
-    #[inline]
-    pub const fn capacity(&self) -> usize {
-        self.0.cap
-    }
-
-    /// Returns the number of elements in the vector, also referred to
-    /// as its 'length'.
-    ///
-    /// See [Vec::len]
-    #[inline]
-    pub const fn len(&self) -> usize {
-        self.0.len
-    }
-
-    /// Returns `true` if the vector contains no elements.
-    ///
-    /// See [Vec::is_empty]
-    #[inline]
-    pub const fn is_empty(&self) -> bool {
-        self.0.len == 0
-    }
-
-    /// Returns a raw pointer to the vector's buffer, or a dangling raw pointer
-    /// valid for zero sized reads if the vector didn't allocate.
-    ///
-    /// See [Vec::as_ptr]
-    #[inline]
-    pub const fn as_ptr(&self) -> *const T {
-        if self.0.is_local() {
-            self.0.local.as_ptr().cast()
-        } else {
-            self.0.ptr.as_ptr()
-        }
-    }
-
-    /// Returns a raw mutable pointer to the vector's buffer, or a dangling
-    /// raw pointer valid for zero sized reads if the vector didn't allocate.
-    ///
-    /// See [Vec::as_mut_ptr]
-    #[inline]
-    pub const fn as_mut_ptr(&mut self) -> *mut T {
-        if self.0.is_local() {
-            self.0.local.as_mut_ptr().cast()
-        } else {
-            self.0.ptr.as_ptr()
-        }
-    }
-
-    /// Extracts a slice containing the entire vector.
-    ///
-    /// See [Vec::as_slice]
-    pub const fn as_slice(&self) -> &[T] {
-        unsafe { slice::from_raw_parts(self.as_ptr(), self.0.len) }
-    }
-
-    /// Extracts a mutable slice of the entire vector.
-    ///
-    /// See [Vec::as_mut_slice]
-    pub const fn as_mut_slice(&mut self) -> &mut [T] {
-        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.0.len) }
-    }
-
-    /// Converts the vector into [`Box<[T]>`](Box).
-    ///
-    /// See [Vec::into_boxed_slice]
-    pub fn into_boxed_slice(self) -> Box<[T]> {
-        if self.0.is_local() {
-            let this = ManuallyDrop::new(self);
-            let mut vec = Vec::with_capacity(this.0.len);
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    this.0.local.as_ptr().cast(),
-                    vec.as_mut_ptr(),
-                    this.0.len,
-                );
-            }
-            vec.into_boxed_slice()
-        } else {
-            self.into_vec().into()
-        }
-    }
-
-    /// Converts the vector into [`Vec`].
-    pub fn into_vec(self) -> Vec<T> {
-        let this = ManuallyDrop::new(self);
-        if this.0.is_local() {
-            let mut vec = Vec::with_capacity(N);
-            let local_ptr = this.0.local.as_ptr().cast();
-            unsafe {
-                ptr::copy_nonoverlapping(local_ptr, vec.as_mut_ptr(), this.0.len);
-            }
-            vec
-        } else {
-            unsafe { this.0.get_vec() }
-        }
-    }
-}
-
-impl<T, const N: usize> Drop for SmallVec<T, N> {
-    fn drop(&mut self) {
-        let guard = DeallocGuard(self);
-        let slice = ptr::slice_from_raw_parts_mut(guard.0.as_mut_ptr(), guard.0.len());
-        unsafe { ptr::drop_in_place(slice) };
-    }
-}
-
-impl<T: fmt::Debug, const N: usize> fmt::Debug for SmallVec<T, N> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self.as_slice(), f)
-    }
-}
-
-impl<T, const N: usize> Default for SmallVec<T, N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T, const N: usize> FromIterator<T> for SmallVec<T, N> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        fn init_from_vec<T, const N: usize>(this: &mut SmallVec<T, N>, mut vec: Vec<T>) {
-            this.0.ptr = NonNull::new(vec.as_mut_ptr()).unwrap();
-            this.0.len = vec.len();
-            this.0.cap = vec.capacity();
-        }
-
-        let mut this = Self::new();
-        let mut iter = iter.into_iter();
-        let (lower, _) = iter.size_hint();
-        if lower > N {
-            #[cold]
-            fn from_iter_impl<T, const N: usize>(
-                this: &mut SmallVec<T, N>,
-                lower: usize,
-                iter: impl IntoIterator<Item = T>,
-            ) {
-                // Do not use `Vec::from_iter` to ensure the capacity is greater than N
-                // (handling the case where `lower` is wrong)
-                let mut vec = Vec::with_capacity(lower);
-                vec.extend(iter);
-                init_from_vec(this, vec);
-            }
-            from_iter_impl(&mut this, lower, iter);
-            return this;
-        }
-        for i in 0..N {
-            match iter.next() {
-                Some(item) => this.0.local[i] = MaybeUninit::new(item),
-                None => return this,
-            }
-            this.0.len = i;
-        }
-        if let Some(item) = iter.next() {
-            #[cold]
-            fn from_iter_impl<T, const N: usize>(
-                this: &mut SmallVec<T, N>,
-                item: T,
-                iter: impl IntoIterator<Item = T>,
-            ) {
-                let mut vec = Vec::with_capacity(2 * N);
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        this.0.local.as_ptr().cast::<T>(),
-                        vec.as_mut_ptr(),
-                        N,
-                    );
-                    ptr::write(vec.as_mut_ptr().add(N + 1), item);
-                    vec.set_len(N + 1);
-                }
-                vec.extend(iter);
-                init_from_vec(this, vec);
-            }
-            from_iter_impl(&mut this, item, iter);
-        }
-        this
-    }
-}
-
-impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
-    type Item = T;
-    type IntoIter = IntoIter<T, N>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        IntoIter {
-            vec: ManuallyDrop::new(self),
-            cur: 0,
-        }
-    }
-}
-
-/// An iterator that moves out of a vector.
-///
-/// See [`alloc::vec::IntoIter`]
-pub struct IntoIter<T, const N: usize> {
-    vec: ManuallyDrop<SmallVec<T, N>>,
-    cur: usize,
-}
-
-impl<T, const N: usize> Iterator for IntoIter<T, N> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.cur == self.vec.len() {
-            return None;
-        }
-        let item = unsafe { self.vec.as_ptr().add(self.cur).read() };
-        self.cur += 1;
-        Some(item)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = self.vec.len() - self.cur;
-        (size, Some(size))
-    }
-}
-
-impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.cur == self.vec.len() {
-            return None;
-        }
-        self.vec.0.len -= 1;
-        let item = unsafe { self.vec.as_ptr().add(self.vec.len()).read() };
-        Some(item)
-    }
-}
-
-impl<T, const N: usize> ExactSizeIterator for IntoIter<T, N> {}
-
-impl<T, const N: usize> FusedIterator for IntoIter<T, N> {}
-
-impl<T, const N: usize> Drop for IntoIter<T, N> {
-    fn drop(&mut self) {
-        let guard = DeallocGuard(&mut self.vec);
-        let ptr = unsafe { guard.0.as_mut_ptr().add(self.cur) };
-        let slice = ptr::slice_from_raw_parts_mut(ptr, guard.0.len() - self.cur);
-        unsafe { ptr::drop_in_place(slice) };
     }
 }
