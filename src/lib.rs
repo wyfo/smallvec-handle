@@ -456,10 +456,11 @@ impl<T, const N: usize> SmallVecHandle<'_, T, N> {
     }
 
     /// # Safety
-    /// `need_grow(1)` must have returned `true`
+    ///
+    /// length is equal to capacity
     #[inline(never)]
     unsafe fn grow_one(&mut self) {
-        // SAFETY: `need_grow(1)` has returned `true`
+        // SAFETY: `need_grow(1)` would return `true`
         unsafe { self.grow(1, false, false).unwrap() };
     }
 
@@ -660,8 +661,8 @@ impl<T, const N: usize> SmallVecHandle<'_, T, N> {
         }
 
         // space for the new element
-        if self.need_grow(1) {
-            // SAFETY: `need_grow` has returned `true`
+        if len == self.capacity() {
+            // SAFETY: length is equal to capacity
             unsafe { self.grow_one() };
         }
 
@@ -997,8 +998,8 @@ impl<T, const N: usize> SmallVecHandle<'_, T, N> {
         let len = self.0.len;
         // This will panic or abort if we would allocate > isize::MAX bytes
         // or if the length increment would overflow for zero-sized types.
-        if self.need_grow(1) {
-            // SAFETY: `need_grow` has returned `true`
+        if len == self.capacity() {
+            // SAFETY: length is equal to capacity
             unsafe { self.grow_one() };
         }
         // SAFETY: copied from stdlib
