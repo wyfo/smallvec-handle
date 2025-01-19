@@ -3,8 +3,6 @@
 
 extern crate test;
 
-use std::hint::black_box;
-
 use smallvec_handle::SmallVecHandle;
 use test::Bencher;
 
@@ -308,7 +306,8 @@ fn gen_push<V: Vector<u64>>(n: u64, b: &mut Bencher) {
         for x in 0..n {
             push_noinline(handle.reborrow(), x);
         }
-        black_box(handle);
+        drop(handle);
+        vec
     });
 }
 
@@ -324,7 +323,8 @@ fn gen_insert_push<V: Vector<u64>>(n: u64, b: &mut Bencher) {
         for x in 0..n {
             insert_push_noinline(handle.reborrow(), x);
         }
-        black_box(handle);
+        drop(handle);
+        vec
     });
 }
 
@@ -343,7 +343,8 @@ fn gen_insert<V: Vector<u64>>(n: u64, b: &mut Bencher) {
         for x in 0..n {
             insert_noinline(handle.reborrow(), 0, x);
         }
-        black_box(handle);
+        drop(handle);
+        vec
     });
 }
 
@@ -360,7 +361,8 @@ fn gen_remove<V: Vector<u64>>(n: usize, b: &mut Bencher) {
         for _ in 0..n {
             remove_noinline(handle.reborrow(), 0);
         }
-        black_box(handle);
+        drop(handle);
+        vec
     });
 }
 
@@ -369,7 +371,8 @@ fn gen_extend<V: Vector<u64>>(n: u64, b: &mut Bencher) {
         let mut vec = V::new();
         let mut handle = V::handle(&mut vec);
         handle.extend(0..n);
-        black_box(handle);
+        drop(handle);
+        vec
     });
 }
 
@@ -378,7 +381,8 @@ fn gen_extend_filtered<V: Vector<u64>>(n: u64, b: &mut Bencher) {
         let mut vec = V::new();
         let mut handle = V::handle(&mut vec);
         handle.extend((0..n).filter(|i| i % 2 == 0));
-        black_box(handle);
+        drop(handle);
+        vec
     });
 }
 
@@ -386,7 +390,7 @@ fn gen_from_slice<V: Vector<u64>>(n: u64, b: &mut Bencher) {
     let v: Vec<u64> = (0..n).collect();
     b.iter(|| {
         let vec = V::from_elems(&v);
-        black_box(vec);
+        vec
     });
 }
 
@@ -396,7 +400,8 @@ fn gen_extend_from_slice<V: Vector<u64>>(n: u64, b: &mut Bencher) {
         let mut vec = V::new();
         let mut handle = V::handle(&mut vec);
         handle.extend_from_slice(&v);
-        black_box(handle);
+        drop(handle);
+        vec
     });
 }
 
@@ -413,13 +418,14 @@ fn gen_pushpop<V: Vector<u64>>(b: &mut Bencher) {
         for x in 0..SPILLED_SIZE as _ {
             pushpop_noinline(handle.reborrow(), x);
         }
-        black_box(handle);
+        drop(handle);
+        vec
     });
 }
 
 fn gen_from_elem<V: Vector<u64>>(n: usize, b: &mut Bencher) {
     b.iter(|| {
         let vec = V::from_elem(42, n);
-        black_box(vec);
+        vec
     });
 }
