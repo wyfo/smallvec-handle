@@ -7,9 +7,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 //! A [`Vec`]-like container that can store a small number of elements inline.
 //!
-//! Contrary to other alternative small vector implementation, which use a tagged union to
-//! distinguish between local and heap storage, this one uses a single pointer for both local and
-//! heap slice.
+//! Contrary to alternative small vector implementations, which use a tagged union to distinguish
+//! between local and heap storage, this one uses a single pointer for both local and heap slice.
 //!
 //! Because the pointer may be invalidated when the vector is moved, it must be checked before each
 //! operation on the vector. To avoid needlessly repeating this check, it is done only once, while
